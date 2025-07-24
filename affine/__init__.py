@@ -30,7 +30,9 @@ from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
-
+# Added deque for bounded result cache
+from typing import List, Dict, Any, Union, Optional, Deque
+from collections import deque
 
 
 __version__ = "0.0.0"
@@ -421,7 +423,8 @@ def validate(coldkey: str, hotkey: str):
     LAST = 0
     ALPHA = 0.9
     TEMPO = 100
-    RESULTS: List[Result] = []
+    # Use bounded deque to prevent unbounded memory growth
+    RESULTS: Deque[Result] = deque(maxlen=10000)  # keep most-recent 10k results (~ a few MB)
     async def maybe_set_weights( sub, meta, block ): 
         nonlocal LAST, RESULTS       
         if block - LAST < TEMPO: return
@@ -429,7 +432,7 @@ def validate(coldkey: str, hotkey: str):
         next_results = await dataset( tail = min(block - LAST, 1000) )
         for res in next_results:
             if res.hotkey in meta.hotkeys and bool(meta.validator_permit[ meta.hotkeys.index( res.hotkey) ]):
-                RESULTS.append( res )
+                RESULTS.append( res )  # leftmost items are automatically discarded when over limit
         LAST = block
 
         # ---------------- Compute scores ------------------------
@@ -487,10 +490,24 @@ def validate(coldkey: str, hotkey: str):
         ]
         logger.info("\nValidator Summary:\n%s", tabulate(r, h, tablefmt="plain"))
         
+    # ---------------- Watchdog for liveness. ------------------------
+    LAST_PROGRESS = time.monotonic()
+
+    async def _watchdog(threshold: int = 300, check_interval: int = 60):
+        """Terminate the process if no progress event in <threshold> seconds."""
+        while True:
+            await asyncio.sleep(check_interval)
+            if time.monotonic() - LAST_PROGRESS > threshold:
+                logger.error("Watchdog: no progress for %ds — exiting so container can restart", threshold)
+                os._exit(1)  # rude but ensures container restart
+
     # ---------------- Main loop. ------------------------
     async def loop():
+        nonlocal LAST_PROGRESS
         subtensor = None
         envs = { name: cls() for name, cls in ENVS.items() }
+        # Kick off background watchdog
+        asyncio.create_task(_watchdog())
         while True:
             try:
                 if subtensor is None: subtensor = await get_subtensor()
@@ -502,6 +519,8 @@ def validate(coldkey: str, hotkey: str):
                 results    = await run(challenges, miners_map, timeout=90)
                 await sink( wallet = wallet, block = blk, results = results )
                 await maybe_set_weights( subtensor, meta, blk )
+                # progress marker
+                LAST_PROGRESS = time.monotonic()
             except asyncio.CancelledError: break
             except Exception as e:
                 traceback.print_exc()
