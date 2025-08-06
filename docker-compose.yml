@@ -14,11 +14,38 @@ services:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - validator-cache:/app/data/blocks
     ports:
-      - "8001:8000"           # host 8001 → container’s AFFINE_METRICS_PORT=8000
+      - "8001:8000"           # host 8001 → container's AFFINE_METRICS_PORT=8000
     environment:
       - AFFINE_CACHE_DIR=/app/data/blocks
       - AFFINE_METRICS_PORT=8000
       - AFFINE_METRICS_ADDR=0.0.0.0
+      - AFFINE_HTTP_CONCURRENCY=10000
+      - AFFINE_HTTP_POOL_SIZE=20000
+      - AFFINE_HTTP_POOL_PER_HOST=5000
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      nproc:
+        soft: 1048576
+        hard: 1048576
+    sysctls:
+      - net.core.somaxconn=65535
+      - net.ipv4.tcp_max_syn_backlog=65535
+      - net.ipv4.ip_local_port_range=1024 65535
+      - net.ipv4.tcp_tw_reuse=1
+      - net.ipv4.tcp_fin_timeout=5
+      - net.core.netdev_max_backlog=65535
+      - net.core.rmem_max=134217728
+      - net.core.wmem_max=134217728
+      - net.ipv4.tcp_rmem=4096 87380 134217728
+      - net.ipv4.tcp_wmem=4096 65536 134217728
+      - net.ipv4.tcp_congestion_control=bbr
+      - net.ipv4.tcp_mtu_probing=1
+      - net.core.default_qdisc=fq
+      - net.ipv4.tcp_keepalive_time=120
+      - net.ipv4.tcp_keepalive_intvl=30
+      - net.ipv4.tcp_keepalive_probes=3
     command: ["-vv", "validate"]
 
   runner:
@@ -32,12 +59,39 @@ services:
     volumes:
       - ./.env:/app/.env:ro
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
-      # runner doesn’t need the cache—omit or give its own if desired
+      # runner doesn't need the cache—omit or give its own if desired
     ports:
-      - "8002:8000"           # host 8002 → container’s AFFINE_METRICS_PORT=8000
+      - "8002:8000"           # host 8002 → container's AFFINE_METRICS_PORT=8000
     environment:
       - AFFINE_METRICS_PORT=8000
       - AFFINE_METRICS_ADDR=0.0.0.0
+      - AFFINE_HTTP_CONCURRENCY=10000
+      - AFFINE_HTTP_POOL_SIZE=20000
+      - AFFINE_HTTP_POOL_PER_HOST=5000
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      nproc:
+        soft: 1048576
+        hard: 1048576
+    sysctls:
+      - net.core.somaxconn=65535
+      - net.ipv4.tcp_max_syn_backlog=65535
+      - net.ipv4.ip_local_port_range=1024 65535
+      - net.ipv4.tcp_tw_reuse=1
+      - net.ipv4.tcp_fin_timeout=5
+      - net.core.netdev_max_backlog=65535
+      - net.core.rmem_max=134217728
+      - net.core.wmem_max=134217728
+      - net.ipv4.tcp_rmem=4096 87380 134217728
+      - net.ipv4.tcp_wmem=4096 65536 134217728
+      - net.ipv4.tcp_congestion_control=bbr
+      - net.ipv4.tcp_mtu_probing=1
+      - net.core.default_qdisc=fq
+      - net.ipv4.tcp_keepalive_time=120
+      - net.ipv4.tcp_keepalive_intvl=30
+      - net.ipv4.tcp_keepalive_probes=3
     command: ["-vv", "runner"]
 
   prometheus:

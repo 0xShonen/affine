@@ -102,13 +102,34 @@ def get_conf(key, default=None) -> Any:
 #                               Subtensor                                     #
 # --------------------------------------------------------------------------- #
 SUBTENSOR = None
+SUBTENSOR_LOCK = None
+
 async def get_subtensor():
-    global SUBTENSOR
-    if SUBTENSOR == None:
-        logger.trace("Making Bittensor connection...")
-        SUBTENSOR = bt.async_subtensor( get_conf('SUBTENSOR_ENDPOINT', default='finney') )
-        await SUBTENSOR.initialize()
-        logger.trace("Connected")
+    global SUBTENSOR, SUBTENSOR_LOCK
+    
+    # Initialize lock if needed
+    if SUBTENSOR_LOCK is None:
+        SUBTENSOR_LOCK = asyncio.Lock()
+    
+    # Check if we need to recreate due to different event loop
+    try:
+        if SUBTENSOR is not None:
+            # Try to access the loop to see if it's still valid
+            _ = SUBTENSOR._loop
+            # If we get here and the loop is different, recreate
+            if SUBTENSOR._loop != asyncio.get_running_loop():
+                SUBTENSOR = None
+    except:
+        SUBTENSOR = None
+    
+    if SUBTENSOR is None:
+        async with SUBTENSOR_LOCK:
+            # Double-check after acquiring lock
+            if SUBTENSOR is None:
+                logger.trace("Making Bittensor connection...")
+                SUBTENSOR = bt.async_subtensor( get_conf('SUBTENSOR_ENDPOINT', default='finney') )
+                await SUBTENSOR.initialize()
+                logger.trace("Connected")
     return SUBTENSOR
 
 # --------------------------------------------------------------------------- #
@@ -251,6 +272,7 @@ ENDPOINT = f"https://{BUCKET}.r2.cloudflarestorage.com"
 get_client_ctx = lambda: get_session().create_client(
     "s3", endpoint_url=ENDPOINT,
     aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
+    region_name="auto",
     config=Config(max_pool_connections=256)
 )
 
@@ -388,8 +410,42 @@ async def prune(tail: int):
 # --------------------------------------------------------------------------- #
 #                               QUERY                                         #
 # --------------------------------------------------------------------------- #
-HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
+HTTP_SEM = None
+HTTP_SESSION = None
+HTTP_SESSION_LOCK = None
 TERMINAL = {400, 404, 410}
+
+def get_http_semaphore():
+    global HTTP_SEM
+    if HTTP_SEM is None:
+        HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "100")))
+    return HTTP_SEM
+
+async def get_http_session():
+    global HTTP_SESSION, HTTP_SESSION_LOCK
+    
+    # Initialize lock if needed
+    if HTTP_SESSION_LOCK is None:
+        HTTP_SESSION_LOCK = asyncio.Lock()
+    
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        async with HTTP_SESSION_LOCK:
+            if HTTP_SESSION is None or HTTP_SESSION.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=int(os.getenv("AFFINE_HTTP_POOL_SIZE", "200")),
+                    limit_per_host=int(os.getenv("AFFINE_HTTP_POOL_PER_HOST", "50")),
+                    ttl_dns_cache=300
+                )
+                HTTP_SESSION = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=aiohttp.ClientTimeout(total=None)
+                )
+    return HTTP_SESSION
+
+async def cleanup_http_session():
+    global HTTP_SESSION
+    if HTTP_SESSION is not None and not HTTP_SESSION.closed:
+        await HTTP_SESSION.close()
 async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> Response:
     url = f"https://{slug}.chutes.ai/v1/chat/completions"
     hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
@@ -397,20 +453,21 @@ async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm"
     QCOUNT.labels(model=model).inc()
     R = lambda resp, at, err, ok: Response(response=resp, latency_seconds=time.monotonic()-start,
                                           attempts=at, model=model, error=err, success=ok)
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
-        for attempt in range(1, retries+2):
-            try:
-                payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
-                async with HTTP_SEM, sess.post(url, json=payload,
-                                               headers=hdr, timeout=timeout) as r:
-                    txt = await r.text(errors="ignore")
-                    if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
-                    r.raise_for_status()
-                    content = (await r.json())["choices"][0]["message"]["content"]
-                    return R(content, attempt, None, True)
-            except Exception as e:
-                if attempt > retries: return R(None, attempt, str(e), False)
-                await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
+    sess = await get_http_session()
+    sem = get_http_semaphore()
+    for attempt in range(1, retries+2):
+        try:
+            payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+            async with sem, sess.post(url, json=payload,
+                                           headers=hdr, timeout=timeout) as r:
+                txt = await r.text(errors="ignore")
+                if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
+                r.raise_for_status()
+                content = (await r.json())["choices"][0]["message"]["content"]
+                return R(content, attempt, None, True)
+        except Exception as e:
+            if attempt > retries: return R(None, attempt, str(e), False)
+            await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
 
 LOG_TEMPLATE = (
     "[RESULT] "
@@ -586,10 +643,13 @@ def runner():
                 await asyncio.sleep(10)  # Wait before retrying
                 continue
     async def main():
-        await asyncio.gather(
-            _run(),
-            watchdog(timeout = (60 * 10))
-        )
+        try:
+            await asyncio.gather(
+                _run(),
+                watchdog(timeout = (60 * 10))
+            )
+        finally:
+            await cleanup_http_session()
     asyncio.run(main())
 
 # --------------------------------------------------------------------------- #
@@ -763,10 +823,13 @@ def validate():
                 continue
             
     async def main():
-        await asyncio.gather(
-            _run(),
-            watchdog(timeout = (60 * 10))
-        )
+        try:
+            await asyncio.gather(
+                _run(),
+                watchdog(timeout = (60 * 10))
+            )
+        finally:
+            await cleanup_http_session()
     asyncio.run(main())
     
     

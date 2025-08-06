@@ -34,4 +34,16 @@ COPY . .
 ENV VIRTUAL_ENV=$VENV_DIR
 RUN uv pip install -e .
 
-ENTRYPOINT ["af"]
+# 7) Set system limits
+RUN echo "* soft nofile 1048576" >> /etc/security/limits.conf && \
+    echo "* hard nofile 1048576" >> /etc/security/limits.conf && \
+    echo "* soft nproc 1048576" >> /etc/security/limits.conf && \
+    echo "* hard nproc 1048576" >> /etc/security/limits.conf && \
+    echo "root soft nofile 1048576" >> /etc/security/limits.conf && \
+    echo "root hard nofile 1048576" >> /etc/security/limits.conf
+
+# 8) Create script to check limits on startup
+RUN echo '#!/bin/bash\necho "Current limits:"\nulimit -n\nulimit -u\nexec "$@"' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh", "af"]
