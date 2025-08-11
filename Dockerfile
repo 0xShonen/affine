@@ -6,6 +6,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip python3-dev \
     build-essential curl pkg-config libssl-dev \
+    git ca-certificates \
+    coreutils \
  && rm -rf /var/lib/apt/lists/*
 
 # 2) Create and activate venv
@@ -33,5 +35,14 @@ RUN uv pip install -e .
 COPY . .
 ENV VIRTUAL_ENV=$VENV_DIR
 RUN uv pip install -e .
+
+# 7) Install Lean 4 (elan toolchain) and lean binary
+RUN curl -L https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o /tmp/elan-init.sh \
+ && bash /tmp/elan-init.sh -y --default-toolchain stable \
+ && rm -f /tmp/elan-init.sh
+ENV PATH="/root/.elan/bin:$PATH"
+
+# Verify lean installation
+RUN lean --version || (echo "Lean install failed" && exit 1)
 
 ENTRYPOINT ["af"]

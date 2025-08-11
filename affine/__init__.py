@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import click
+import socket
 import random
 import hashlib
 import aiohttp
@@ -28,19 +29,18 @@ from tqdm.asyncio import tqdm
 from tabulate import tabulate
 from dotenv import load_dotenv
 from typing import AsyncIterator
+from urllib.parse import urlparse
 from huggingface_hub import HfApi
 from botocore.config import Config
 from collections import defaultdict
 from abc import ABC, abstractmethod
+from aiohttp import ClientConnectorError
 from aiobotocore.session import get_session
 from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence, Literal, TypeVar, Awaitable
 from pydantic import root_validator
-from aiohttp import ClientConnectorError
-import socket
-from urllib.parse import urlparse
 
 __version__ = "0.0.0"
 
@@ -115,6 +115,23 @@ async def get_subtensor():
     return SUBTENSOR
 
 # --------------------------------------------------------------------------- #
+#                               Sandbox                                       # 
+# --------------------------------------------------------------------------- #
+SANDBOX = None
+def get_sandbox():
+    global SANDBOX
+    from .utils.sandbox import SandboxManager
+    if SANDBOX == None:
+        logger.trace("Making docker sandbox...")
+        SANDBOX = SandboxManager(
+            image=".",   
+            workdir="/work",
+            pull=False,
+        )
+        logger.trace("Sandbox created")
+    return SANDBOX
+
+# --------------------------------------------------------------------------- #
 #                           Base‑level data models                            #
 # --------------------------------------------------------------------------- #
 def _truncate(t: Optional[str], max_len: int = 80) -> str:
@@ -158,7 +175,8 @@ class Challenge(BaseModel):
         from .envs.sat import SAT
         from .envs.abd import ABD
         from .envs.ded import DED
-        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
+        from .envs.mth import MTH
+        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED, "MTH": MTH}
         return ENVS[v]() if isinstance(v, str) else v
     class Config:
         arbitrary_types_allowed = True
@@ -180,7 +198,8 @@ class Evaluation(BaseModel):
         from .envs.sat import SAT
         from .envs.abd import ABD
         from .envs.ded import DED
-        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
+        from .envs.mth import MTH
+        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED, "MTH": MTH}
         return ENVS[v]() if isinstance(v, str) else v
     class Config:
         arbitrary_types_allowed = True
@@ -235,7 +254,8 @@ class Result(BaseModel):
 from .envs.sat import SAT
 from .envs.abd import ABD
 from .envs.ded import DED
-ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
+from .envs.mth import MTH
+ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED, "MTH": MTH}
 
 # --------------------------------------------------------------------------- #
 #                   S3 helpers                                                #

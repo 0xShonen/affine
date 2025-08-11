@@ -68,6 +68,7 @@ class ABD(af.BaseEnv):
     __version__: str = "0.0.0"
     def __init__(self):
         super().__init__()
+        self._mgr = af.get_sandbox()
         self._executor = af.utils.ProgramExecutor()
         self._data = af.utils.BufferedDataset(
             dataset_name="satpalsr/rl-python",
@@ -100,9 +101,10 @@ class ABD(af.BaseEnv):
             return None
 
         loop = asyncio.get_running_loop()
-        output, error = await loop.run_in_executor(
-            None, self._executor.execute, program, gen_input
-        )
+        with self._mgr.acquire() as box:
+            output, error = await loop.run_in_executor(
+                None, self._executor.execute_in_lease, box, program, gen_input
+            )
         af.logger.trace(f"Executed program with generated input. Output: {output}, Error: {error}, program: {program}")
         if error or not output.strip():
             af.logger.trace("Generated input contains error")
@@ -183,9 +185,10 @@ class ABD(af.BaseEnv):
                 extra={"error": "No input found", "expected_output": expected}
             )
         loop = asyncio.get_running_loop()
-        out, err = await loop.run_in_executor(
-            None, self._executor.execute, prog, gen_in
-        )
+        with self._mgr.acquire() as box:
+            out, err = await loop.run_in_executor(
+                None, self._executor.execute_in_lease, box, prog, gen_in
+            )
         af.logger.trace(f"Executed program with generated input. Output: {out}, Error: {err}")
         if err:
             af.logger.trace("Error occurred during program execution.")
