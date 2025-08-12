@@ -55,8 +55,8 @@ class ProgramExecutor:
         box.exec(["sh", "-lc", script])
         box.put_file_bytes(STDIN_PATH, (stdin_data or "").encode("utf-8"))
 
-    def _exec_py(self, box, timeout: Optional[int], stdin_data: str) -> Tuple[int, bytes, bool]:
-        tflag = f"timeout {int(timeout)}s " if timeout and timeout > 0 else ""
+    def _exec_py(self, box, timeout: Optional[int], stdin_data: str) -> Tuple[int, bytes, bytes, bool]:
+        tflag = f"timeout {int(timeout)} " if timeout and timeout > 0 else ""
         payload = stdin_data if isinstance(stdin_data, str) else (stdin_data or "")
         if payload and not payload.endswith("\n"):
             payload += "\n"
@@ -66,17 +66,21 @@ class ProgramExecutor:
             f"AFFINE_EOF\n"
         )
         cmd = ["sh", "-lc", script]
-        code, out = box.exec(cmd)
+        # New sandbox API returns ExecResult; adapt accordingly
+        exec_result = box.exec(cmd)
+        code = exec_result.code
+        out = exec_result.stdout
+        err = exec_result.stderr
         timed_out = (code == 124 or code == 137)
-        return code, out, timed_out
+        return code, out, err, timed_out
 
     def execute_in_lease(self, box, raw_code: str, stdin: str | bytes = "") -> Tuple[str, str]:
         code = self._strip_fences(raw_code)
         stdin_text = stdin if isinstance(stdin, str) else (stdin.decode() if isinstance(stdin, (bytes, bytearray)) else "")
         self._write_files(box, code, stdin_text)
-        _, out_bytes, timed_out = self._exec_py(box, self.timeout, stdin_text)
+        _, out_bytes, err_bytes, timed_out = self._exec_py(box, self.timeout, stdin_text)
         out_text = out_bytes.decode(errors="replace")
-        err_text = ""
+        err_text = err_bytes.decode(errors="replace")
         if self._auto_runner_needed(code, out_text, err_text) and not timed_out:
             runner = (
                 "\n\nif __name__ == \"__main__\":\n"
@@ -89,8 +93,9 @@ class ProgramExecutor:
                 "            print(res)\n"
             )
             self._write_files(box, code + runner, stdin_text)
-            _, out_bytes, timed_out = self._exec_py(box, self.timeout, stdin_text)
+            _, out_bytes, err_bytes, timed_out = self._exec_py(box, self.timeout, stdin_text)
             out_text = out_bytes.decode(errors="replace")
+            err_text = err_bytes.decode(errors="replace")
         out_final = self._truncate_io(out_text, timed_out)
-        err_final = ""
+        err_final = self._truncate_io(err_text, timed_out) if err_text else ""
         return out_final, err_final 

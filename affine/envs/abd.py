@@ -4,6 +4,7 @@ import random
 import asyncio
 import affine as af
 from typing import Any, Dict, Optional, Tuple
+from affine.utils.sandbox import SandboxManager
 
 MODELS = ["unsloth/gemma-3-12b-it"]
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
@@ -68,13 +69,25 @@ class ABD(af.BaseEnv):
     __version__: str = "0.0.0"
     def __init__(self):
         super().__init__()
-        self._mgr = af.get_sandbox()
         self._executor = af.utils.ProgramExecutor()
         self._data = af.utils.BufferedDataset(
             dataset_name="satpalsr/rl-python",
             total_size=20_000,
             buffer_size=5,
             max_batch=5,
+        )
+        self._mgr = SandboxManager(
+            image="python:3.11-alpine",
+            workdir="/work",
+            pull=True,
+            tmpfs={"/work": "rw,size=512m", "/tmp": "rw,size=256m"},
+            network_disabled=True,
+            read_only_root=False,
+            mem_limit="1g",
+            cpus=1.0,
+            label_ns="rl-lean-sandbox",
+            max_exec_retries=5,
+            healthcheck_cmd="test -x /bin/sh || exit 1",
         )
         
     async def _create_challenge(

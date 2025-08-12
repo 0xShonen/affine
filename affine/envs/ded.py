@@ -6,6 +6,7 @@ import json
 import asyncio
 import affine as af
 from typing import Any, Dict, List, Tuple, Optional
+from affine.utils.sandbox import SandboxManager
 
 # -------------------------------- Helpers -------------------------------- #
 def _to_str(x) -> str:
@@ -37,13 +38,25 @@ class DED(af.BaseEnv):
     def __init__(self):
         super().__init__()
         # Use SandboxManager provided by the Affine runtime
-        self._mgr = af.get_sandbox()  # expected to return a configured SandboxManager
         self._executor = af.utils.ProgramExecutor()
         self._data = af.utils.BufferedDataset(
             dataset_name="satpalsr/rl-python",
             total_size=20_000,
             buffer_size=5,
             max_batch=5,
+        )
+        self._mgr = SandboxManager(
+            image="python:3.11-alpine",
+            workdir="/work",
+            pull=True,
+            tmpfs={"/work": "rw,size=512m", "/tmp": "rw,size=256m"},
+            network_disabled=True,
+            read_only_root=False,
+            mem_limit="1g",
+            cpus=1.0,
+            label_ns="rl-lean-sandbox",
+            max_exec_retries=5,
+            healthcheck_cmd="test -x /bin/sh || exit 1",
         )
 
     # ----------------------------- Env API -------------------------------- #
