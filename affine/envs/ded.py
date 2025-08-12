@@ -32,6 +32,25 @@ _HAS_MAIN  = re.compile(r'if\s+__name__\s*==\s*[\'\"]__main__[\'\"]')
 # --------------------------------------------------------------------------- #
 #                              Affine Env (Docker)                            #
 # --------------------------------------------------------------------------- #
+
+MANAGER = None
+def manager():
+    if MANAGER == None:
+        MANAGER = SandboxManager(
+            image="python:3.11-alpine",
+            workdir="/work",
+            pull=True,
+            tmpfs={"/work": "rw,size=512m", "/tmp": "rw,size=256m"},
+            network_disabled=True,
+            read_only_root=False,
+            mem_limit="1g",
+            cpus=1.0,
+            label_ns="rl-lean-sandbox",
+            max_exec_retries=5,
+            healthcheck_cmd="test -x /bin/sh || exit 1",
+        )
+    return MANAGER
+
 class DED(af.BaseEnv):
     __version__: str = "0.1.0-docker"
 
@@ -44,19 +63,6 @@ class DED(af.BaseEnv):
             total_size=20_000,
             buffer_size=5,
             max_batch=5,
-        )
-        self._mgr = SandboxManager(
-            image="python:3.11-alpine",
-            workdir="/work",
-            pull=True,
-            tmpfs={"/work": "rw,size=512m", "/tmp": "rw,size=256m"},
-            network_disabled=True,
-            read_only_root=False,
-            mem_limit="1g",
-            cpus=1.0,
-            label_ns="rl-lean-sandbox",
-            max_exec_retries=5,
-            healthcheck_cmd="test -x /bin/sh || exit 1",
         )
 
     # ----------------------------- Env API -------------------------------- #
@@ -115,7 +121,7 @@ class DED(af.BaseEnv):
 
         # Reuse one clean sandbox for all cases (faster; still isolated per-challenge)
         loop = asyncio.get_running_loop()
-        with self._mgr.acquire() as box:
+        with manager().acquire() as box:
             # ensure working dir exists (tmpfs is set by manager)
             try:
                 box.exec(["sh", "-lc", "mkdir -p /work && chmod 1777 /work"])

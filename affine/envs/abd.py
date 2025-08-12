@@ -65,18 +65,10 @@ Format your response with <INPUT> </INPUT> tags like this:
 
 Please generate a valid input:"""
 
-class ABD(af.BaseEnv):
-    __version__: str = "0.0.0"
-    def __init__(self):
-        super().__init__()
-        self._executor = af.utils.ProgramExecutor()
-        self._data = af.utils.BufferedDataset(
-            dataset_name="satpalsr/rl-python",
-            total_size=20_000,
-            buffer_size=5,
-            max_batch=5,
-        )
-        self._mgr = SandboxManager(
+MANAGER = None
+def manager():
+    if MANAGER == None:
+        MANAGER = SandboxManager(
             image="python:3.11-alpine",
             workdir="/work",
             pull=True,
@@ -88,6 +80,19 @@ class ABD(af.BaseEnv):
             label_ns="rl-lean-sandbox",
             max_exec_retries=5,
             healthcheck_cmd="test -x /bin/sh || exit 1",
+        )
+    return MANAGER
+
+class ABD(af.BaseEnv):
+    __version__: str = "0.0.0"
+    def __init__(self):
+        super().__init__()
+        self._executor = af.utils.ProgramExecutor()
+        self._data = af.utils.BufferedDataset(
+            dataset_name="satpalsr/rl-python",
+            total_size=20_000,
+            buffer_size=5,
+            max_batch=5,
         )
         
     async def _create_challenge(
@@ -114,7 +119,7 @@ class ABD(af.BaseEnv):
             return None
 
         loop = asyncio.get_running_loop()
-        with self._mgr.acquire() as box:
+        with manager().acquire() as box:
             output, error = await loop.run_in_executor(
                 None, self._executor.execute_in_lease, box, program, gen_input
             )
@@ -198,7 +203,7 @@ class ABD(af.BaseEnv):
                 extra={"error": "No input found", "expected_output": expected}
             )
         loop = asyncio.get_running_loop()
-        with self._mgr.acquire() as box:
+        with manager().acquire() as box:
             out, err = await loop.run_in_executor(
                 None, self._executor.execute_in_lease, box, prog, gen_in
             )

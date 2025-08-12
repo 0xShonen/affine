@@ -19,6 +19,23 @@ def _extract_numeric(text: str) -> Optional[Fraction]:
     m = re.search(r"([-+]?\d+(?:\.\d+)?)", text)
     return Fraction(m.group(1)) if m else None
 
+MANAGER = None
+def manager():
+    if MANAGER == None:
+        MANAGER = SandboxManager(
+            image="leanprovercommunity/lean4:latest",
+            workdir="/work",
+            pull=True,
+            tmpfs={"/work": "rw,size=512m", "/tmp": "rw,size=256m"},
+            network_disabled=True,
+            read_only_root=False,
+            mem_limit="1g",
+            cpus=1.0,
+            label_ns="rl-lean-sandbox",
+            max_exec_retries=5,
+            healthcheck_cmd="test -x /bin/sh || exit 1",
+        )
+    return MANAGER
 
 class MTH(af.BaseEnv):
     """
@@ -40,19 +57,6 @@ class MTH(af.BaseEnv):
             max_batch=5,
             split=split,
             config="main",
-        )
-        self._mgr = SandboxManager(
-            image="leanprovercommunity/lean4:latest",
-            workdir="/work",
-            pull=True,
-            tmpfs={"/work": "rw,size=512m", "/tmp": "rw,size=256m"},
-            network_disabled=True,
-            read_only_root=False,
-            mem_limit="1g",
-            cpus=1.0,
-            label_ns="rl-lean-sandbox",
-            max_exec_retries=5,
-            healthcheck_cmd="test -x /bin/sh || exit 1",
         )
 
     async def generate(self) -> af.Challenge:
@@ -155,7 +159,7 @@ class MTH(af.BaseEnv):
                 box.exec(["sh", "-lc", f"cat > {path} <<'{delim}'\n{text_}\n{delim}"])
 
             start_t = time.monotonic()
-            with self._mgr.acquire() as box:
+            with manager().acquire() as box:
                 try:
                     # Ensure workdir exists & writable
                     box.exec(["sh", "-lc", "mkdir -p /work && chmod 777 /work"])
