@@ -115,23 +115,6 @@ async def get_subtensor():
     return SUBTENSOR
 
 # --------------------------------------------------------------------------- #
-#                               Sandbox                                       # 
-# --------------------------------------------------------------------------- #
-SANDBOX = None
-def get_sandbox():
-    global SANDBOX
-    from .utils.sandbox import SandboxManager
-    if SANDBOX == None:
-        logger.trace("Making docker sandbox...")
-        SANDBOX = SandboxManager(
-            image=".",   
-            workdir="/work",
-            pull=False,
-        )
-        logger.trace("Sandbox created")
-    return SANDBOX
-
-# --------------------------------------------------------------------------- #
 #                           Base‑level data models                            #
 # --------------------------------------------------------------------------- #
 def _truncate(t: Optional[str], max_len: int = 80) -> str:
