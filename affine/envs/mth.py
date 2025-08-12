@@ -51,6 +51,8 @@ class MTH(af.BaseEnv):
             mem_limit="1g",
             cpus=1.0,
             label_ns="rl-lean-sandbox",
+            max_exec_retries=5,
+            healthcheck_cmd="test -x /bin/sh || exit 1",
         )
 
     async def generate(self) -> af.Challenge:
@@ -104,11 +106,14 @@ class MTH(af.BaseEnv):
     async def evaluate(self, challenge: af.Challenge, response: af.Response) -> af.Evaluation:
         text = response.response or ""
         gold = Fraction(challenge.extra["gold"])  # exact compare
-        af.logger.trace("MTH.evaluate: start; gold=%s latency=%.3fs", gold, getattr(response, "latency_seconds", 0.0))
+        af.logger.trace(
+            "MTH.evaluate: start; gold=%s latency=%.3fs",
+            gold, getattr(response, "latency_seconds", 0.0)
+        )
 
         failure_reasons = []
 
-        # 1) Check numeric answer line
+        # ---------- 1) Check numeric answer line ----------
         m = ANSWER_RE.search(text)
         got = Fraction(m.group(1)) if m else None
         answer_ok = (got == gold)
@@ -116,12 +121,16 @@ class MTH(af.BaseEnv):
             failure_reasons.append("no_answer_line")
         elif not answer_ok:
             failure_reasons.append("answer_mismatch")
-        af.logger.trace("MTH.evaluate: answer_present=%s got=%s answer_ok=%s", bool(m), str(got) if got is not None else None, answer_ok)
+        af.logger.trace(
+            "MTH.evaluate: answer_present=%s got=%s answer_ok=%s",
+            bool(m), str(got) if got is not None else None, answer_ok
+        )
 
-        # 2) Compile Lean proof inside sandbox
+        # ---------- 2) Compile Lean proof inside sandbox ----------
         proof_ok = False
         compile_info = None
         pm = PROOF_RE.search(text)
+
         if not pm:
             failure_reasons.append("no_proof_block")
             af.logger.trace("MTH.evaluate: no Lean proof block found")
@@ -130,35 +139,56 @@ class MTH(af.BaseEnv):
             payload = textwrap.dedent(lean_body).encode("utf-8")
             af.logger.trace("MTH.evaluate: proof block present; bytes=%d", len(payload))
 
+            def _write_bytes(box, path: str, data: bytes) -> None:
+                """Write file inside sandbox; fallback to here-doc if put_file_bytes is a no-op."""
+                ok = None
+                try:
+                    ok = box.put_file_bytes(path, data, mode=0o644)
+                except Exception:
+                    ok = None
+                if ok:
+                    return
+                # Fallback: write via here-doc inside the container
+                text_ = data.decode("utf-8", errors="replace")
+                # Use a unique delimiter unlikely to collide
+                delim = "__END_OF_LEAN_SOURCE__"
+                box.exec(["sh", "-lc", f"cat > {path} <<'{delim}'\n{text_}\n{delim}"])
+
             start_t = time.monotonic()
             with self._mgr.acquire() as box:
                 try:
-                    # Ensure workdir exists
-                    box.exec(["sh", "-lc", "mkdir -p /work && chmod 1777 /work"])  # ignore exit code
-                    # Write file
-                    box.put_file_bytes("/work/Solution.lean", payload, mode=0o644)
-                    # Attempt to compile; enforce timeout via `timeout` tool
-                    code, out = box.exec(["sh", "-lc", "timeout 60 lean --make /work/Solution.lean"])  # type: ignore
+                    # Ensure workdir exists & writable
+                    box.exec(["sh", "-lc", "mkdir -p /work && chmod 777 /work"])
+
+                    # Write the Lean file (prefer absolute path to avoid ambiguity)
+                    target = "/work/Solution.lean"
+                    _write_bytes(box, target, payload)
+
+                    # Compile with Lean (no --make; Lean 4 type-checks by file)
+                    exec_result = box.exec(["sh", "-lc", "cd /work && timeout 60 lean Solution.lean"])
+                    code = exec_result.code
+                    out = (exec_result.stdout or b"").decode("utf-8", "replace")
+                    err = (exec_result.stderr or b"").decode("utf-8", "replace")
                     proof_ok = (code == 0)
+
                     duration = time.monotonic() - start_t
-                    out_text = (out or b"").decode("utf-8", errors="replace")
-                    # Truncate potentially large output
                     max_chars = 4000
-                    if len(out_text) > max_chars:
-                        out_text = out_text[:max_chars] + "…"
+                    if len(out) > max_chars: out = out[:max_chars] + "…"
+                    if len(err) > max_chars: err = err[:max_chars] + "…"
+
                     compile_info = {
                         "exit_code": code,
                         "duration_seconds": round(duration, 4),
-                        "output": out_text,
+                        "stdout": out,
+                        "stderr": err,
                         "timed_out": (code == 124),
                     }
                     if not proof_ok:
                         failure_reasons.append("lean_compile_failed" if code != 124 else "lean_compile_timeout")
+
                     af.logger.trace(
                         "MTH.evaluate: lean compile exit_code=%s duration=%.3fs ok=%s",
-                        code,
-                        duration,
-                        proof_ok,
+                        code, duration, proof_ok
                     )
                 except Exception as e:
                     proof_ok = False
@@ -171,8 +201,10 @@ class MTH(af.BaseEnv):
                     failure_reasons.append("sandbox_exception")
                     af.logger.trace("MTH.evaluate: sandbox exception: %s", e)
 
+        # ---------- Score & extras ----------
         score = 1.0 if (answer_ok and proof_ok) else 0.0
         af.logger.trace("MTH.evaluate: done; score=%.4f reasons=%s", score, failure_reasons)
+
         extra = {
             "answer_expected": str(gold),
             "answer_received": str(got) if got is not None else None,
@@ -187,8 +219,4 @@ class MTH(af.BaseEnv):
         if pm:
             extra["lean_source_len"] = len(pm.group(1))
 
-        return af.Evaluation(
-            env=self,
-            score=score,
-            extra=extra,
-        ) 
+        return af.Evaluation(env=self, score=score, extra=extra)
