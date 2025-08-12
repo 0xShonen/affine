@@ -24,7 +24,6 @@ class ProgramExecutor:
         self.timeout     = timeout
         self.max_output  = max_output
         self.python_bin  = python_bin
-
     @staticmethod
     def _strip_fences(text: str) -> str:
         m = _FENCE_RE.search(text or "")
