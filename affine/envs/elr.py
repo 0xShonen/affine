@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Tuple, Optional
 dataset = af.singleton('euler', lambda: af.utils.BufferedDataset(
     dataset_name="alexandonian/project-euler",
     total_size=20_000,
-    buffer_size=5,
-    max_batch=5,
+    buffer_size=30,
+    max_batch=30,
     split='train',
     config='default'
 ))

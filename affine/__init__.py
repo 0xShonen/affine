@@ -28,6 +28,7 @@ from tqdm import tqdm
 import bittensor as bt
 import datasets as hf_ds                    
 from pathlib import Path
+from types import NoneType
 from tqdm.asyncio import tqdm
 from tabulate import tabulate
 from dotenv import load_dotenv
@@ -183,13 +184,15 @@ def _truncate(t: Optional[str], max_len: int = 80) -> str:
     return "" if not t else textwrap.shorten(t, width=max_len, placeholder="…")
 
 class BaseEnv(BaseModel, ABC):
-    """Abstract competition environment."""
+    __version__: str = "0.0.0"
     class Config: arbitrary_types_allowed = True
     @property
-    def name(self) -> str: return self.__class__.__name__
-    def __hash__(self):     return hash(self.name)
-    def __repr__(self):     return self.name
-    # API expected from concrete envs
+    def key(self) -> str:   return "E-" + str(self.__class__.__name__) + "-" + str(self.__version__)
+    @property
+    def name(self) -> str:  return self.key
+    def __repr__(self):     return self.key
+    def __str__(self):     return self.key
+    def __hash__(self):     return hash(self.key)
     @abstractmethod
     async def generate(self) -> "Challenge": ...
     @abstractmethod
@@ -265,7 +268,16 @@ class Miner(BaseModel):
     revision: Optional[str] = None; block: Optional[int] = None
     chute: Optional[Dict[str, Any]] = None
     slug: Optional[str] = None
-    
+    @property
+    def key(self) -> str:   
+        key_str = "MNR-" + "R" + str(self.revision if self.revision else "None") 
+        key_str += "-M" + str(self.model if self.model else "None") 
+        key_str += "-U" + str(self.uid if self.uid else "None") 
+        key_str += "-B" + str(self.block if self.block else "None")
+        return str(key_str)
+    def __hash__(self):     return hash(self.key)
+    def __repr__(self):     return str(self.key)
+    def __str__(self):      return str(self.key)
 
 class Result(BaseModel):
     version: str = __version__
@@ -290,181 +302,6 @@ class Result(BaseModel):
 # Central env registry
 from .envs import ENVS
 
-# --------------------------------------------------------------------------- #
-#                   S3 helpers                                                #
-# --------------------------------------------------------------------------- #
-# ── ENV ──────────────────────────────────────────────────────────────────────
-WINDOW        = int(os.getenv("AFFINE_WINDOW", 20))
-RESULT_PREFIX = "affine/results/"
-INDEX_KEY     = "affine/index.json"
-
-FOLDER  = os.getenv("R2_FOLDER", "affine" )
-BUCKET  = os.getenv("R2_BUCKET_ID", "80f15715bb0b882c9e967c13e677ed7d" )
-ACCESS  = os.getenv("R2_WRITE_ACCESS_KEY_ID", "ff3f4f078019b064bfb6347c270bee4d")
-SECRET  = os.getenv("R2_WRITE_SECRET_ACCESS_KEY", "a94b20516013519b2959cbbb441b9d1ec8511dce3c248223d947be8e85ec754d")
-ENDPOINT = f"https://{BUCKET}.r2.cloudflarestorage.com"
-
-get_client_ctx = lambda: get_session().create_client(
-    "s3", endpoint_url=ENDPOINT,
-    aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
-    config=Config(max_pool_connections=256)
-)
-
-CACHE_DIR = Path(os.getenv("AFFINE_CACHE_DIR",
-                 Path.home() / ".cache" / "affine" / "blocks"))
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-def _w(b: int) -> int: return (b // WINDOW) * WINDOW
-
-# ── fast JSON ───────────────────────────────────────────────────────────────
-try:
-    import orjson as _json
-    _loads, _dumps = _json.loads, _json.dumps
-except ModuleNotFoundError:
-    _loads = lambda b: json.loads(b.decode())
-    _dumps = lambda o: json.dumps(o, separators=(",", ":")).encode()
-    
-# ── Index helpers ───────────────────────────────────────────────────────────
-async def _index() -> list[str]:
-    async with get_client_ctx() as c:
-        r = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
-        return json.loads(await r["Body"].read())
-
-async def _update_index(k: str) -> None:
-    async with get_client_ctx() as c:
-        try:
-            r = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
-            idx = set(json.loads(await r["Body"].read()))
-        except c.exceptions.NoSuchKey:
-            idx = set()
-        if k not in idx:
-            idx.add(k)
-            await c.put_object(Bucket=FOLDER, Key=INDEX_KEY,
-                               Body=_dumps(sorted(idx)),
-                               ContentType="application/json")
-
-# ── Shard cache ─────────────────────────────────────────────────────────────
-async def _cache_shard(key: str, sem: asyncio.Semaphore) -> Path:
-    name, out = Path(key).name, None
-    out = CACHE_DIR / f"{name}.jsonl"; mod = out.with_suffix(".modified")
-    async with sem, get_client_ctx() as c:
-        if out.exists() and mod.exists():
-            h = await c.head_object(Bucket=FOLDER, Key=key)
-            if h["LastModified"].isoformat() == mod.read_text().strip():
-                return out
-        o = await c.get_object(Bucket=FOLDER, Key=key)
-        body, lm = await o["Body"].read(), o["LastModified"].isoformat()
-    tmp = out.with_suffix(".tmp")
-    with tmp.open("wb") as f:
-        f.write(b"\n".join(_dumps(i) for i in _loads(body)) + b"\n")
-    os.replace(tmp, out); mod.write_text(lm)
-    return out
-
-# ── Local JSON‑Lines iterator ───────────────────────────────────────────────
-async def _jsonl(p: Path):
-    try:
-        import aiofiles
-        async with aiofiles.open(p, "rb") as f:
-            async for l in f: yield l.rstrip(b"\n")
-    except ModuleNotFoundError:
-        def _read():                         # run in thread
-            with p.open("rb") as f: return f.read().splitlines()
-        for l in await asyncio.to_thread(_read): yield l
-
-# ── Core async stream (Result objects) ──────────────────────────────────────
-async def dataset(
-    tail: int,
-    *,
-    max_concurrency: int = 10,      # parallel S3 downloads
-) -> AsyncIterator["Result"]:
-    """
-    Stream `Result`s in deterministic order while pre‑downloading future
-    shards concurrently.
-    """
-    # ── figure out which windows we need ────────────────────────────────
-    sub  = await get_subtensor()
-    cur  = await sub.get_current_block()
-    need = {w for w in range(_w(cur - tail), _w(cur) + WINDOW, WINDOW)}
-    keys = [
-        k for k in await _index()
-        if (h := Path(k).name.split("-", 1)[0]).isdigit() and int(h) in need
-    ]
-    keys.sort()    
-    # ── helpers ────────────────────────────────
-    sem = asyncio.Semaphore(max_concurrency)     # throttle S3
-    async def _prefetch(key: str) -> Path:       # just downloads / caches
-        return await _cache_shard(key, sem)
-    tasks: list[asyncio.Task[Path]] = [
-        asyncio.create_task(_prefetch(k)) for k in keys[:max_concurrency]
-    ]
-    next_key = max_concurrency            
-    bar = tqdm(f"Dataset=({cur}, {cur - tail})", unit="res", dynamic_ncols=True)
-    # ── main loop: iterate over keys in order ───────────────────────────
-    for i, key in enumerate(keys):
-        path = await tasks[i]
-        if next_key < len(keys):
-            tasks.append(asyncio.create_task(_prefetch(keys[next_key])))
-            next_key += 1
-        async for raw in _jsonl(path):
-            try:
-                r = Result.model_validate(_loads(raw))
-                if r.verify():
-                    bar.update(1)
-                    yield r
-            except Exception:
-                pass
-    bar.close()
-    
-    
-# --------------------------------------------------------------------------- #
-async def sign_results( wallet, results ):
-    try:
-        signer_url = get_conf('SIGNER_URL', default='http://signer:8080')
-        timeout = aiohttp.ClientTimeout(connect=2, total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            payloads = [str(r.challenge) for r in results]
-            resp = await session.post(f"{signer_url}/sign", json={"payloads": payloads})
-            if resp.status == 200:
-                data = await resp.json()
-                sigs = data.get("signatures") or []
-                hotkey = data.get("hotkey")
-                for r, s in zip(results, sigs):
-                    r.hotkey = hotkey
-                    r.signature = s
-    except Exception as e:
-        logger.info(f"sink: signer unavailable, using local signing: {type(e).__name__}: {e}")
-        hotkey = wallet.hotkey.ss58_address
-        for r in results: 
-            r.sign(wallet)
-    finally:
-        return hotkey, results
-
-# ── Minimal sink / misc helpers (optional) ──────────────────────────────────
-async def sink(wallet: bt.wallet, results: list["Result"], block: int = None):
-    if not results: return
-    if block is None:
-        sub = await get_subtensor(); block = await sub.get_current_block()
-    hotkey, signed = await sign_results( wallet, results )
-    key = f"{RESULT_PREFIX}{_w(block):09d}-{hotkey}.json"
-    dumped = [ r.model_dump(mode="json") for r in signed ]
-    async with get_client_ctx() as c:
-        try:
-            r = await c.get_object(Bucket=FOLDER, Key=key)
-            merged = json.loads(await r["Body"].read()) + dumped
-        except c.exceptions.NoSuchKey:
-            merged = dumped
-        await c.put_object(Bucket=FOLDER, Key=key, Body=_dumps(merged),
-                           ContentType="application/json")
-    if len(merged) == len(dumped):              # shard was new
-        await _update_index(key)
-
-async def prune(tail: int):
-    sub = await get_subtensor(); cur = await sub.get_current_block()
-    for f in CACHE_DIR.glob("*.jsonl"):
-        b = f.name.split("-", 1)[0]
-        if b.isdigit() and int(b) < cur - tail:
-            try: f.unlink()
-            except OSError: pass
 
 # --------------------------------------------------------------------------- #
 #                               QUERY                                         #
@@ -674,6 +511,324 @@ async def miners(
 
 
 # --------------------------------------------------------------------------- #
+#                   S3 helpers                                                #
+# --------------------------------------------------------------------------- #
+# ── ENV ──────────────────────────────────────────────────────────────────────
+WINDOW        = int(os.getenv("AFFINE_WINDOW", 20))
+RESULT_PREFIX = "affine/results/"
+INDEX_KEY     = "affine/index.json"
+
+FOLDER  = os.getenv("R2_FOLDER", "affine" )
+BUCKET  = os.getenv("R2_BUCKET_ID", "80f15715bb0b882c9e967c13e677ed7d" )
+ACCESS  = os.getenv("R2_WRITE_ACCESS_KEY_ID", "ff3f4f078019b064bfb6347c270bee4d")
+SECRET  = os.getenv("R2_WRITE_SECRET_ACCESS_KEY", "a94b20516013519b2959cbbb441b9d1ec8511dce3c248223d947be8e85ec754d")
+ENDPOINT = f"https://{BUCKET}.r2.cloudflarestorage.com"
+
+get_client_ctx = lambda: get_session().create_client(
+    "s3", endpoint_url=ENDPOINT,
+    aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
+    config=Config(max_pool_connections=256)
+)
+
+CACHE_DIR = Path(os.getenv("AFFINE_CACHE_DIR",
+                 Path.home() / ".cache" / "affine" / "blocks"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── fast JSON ───────────────────────────────────────────────────────────────
+try:
+    import orjson as _json
+    _loads, _dumps = _json.loads, _json.dumps
+except ModuleNotFoundError:
+    _loads = lambda b: json.loads(b.decode())
+    _dumps = lambda o: json.dumps(o, separators=(",", ":")).encode()
+    
+# ── Index helpers ───────────────────────────────────────────────────────────
+def _miner_prefix(env: "BaseEnv", miner: Miner) -> str:
+    assert hasattr(env, "key"), "env must be a BaseEnv with a .key"
+    assert hasattr(miner, "key"), "miner must be a Miner with a .key"
+    return f"{RESULT_PREFIX}{env.key}/{miner.key}/"
+
+def _miner_index_key(env: "BaseEnv", miner: Miner) -> str:
+    return f"{_miner_prefix(env, miner)}index.json"
+
+# Key-based internal helpers for string-only contexts (e.g., dataset/index scan)
+def _miner_prefix_keys(env_key: str, miner_key: str) -> str:
+    return f"{RESULT_PREFIX}{env_key}/{miner_key}/"
+
+def _miner_index_key_keys(env_key: str, miner_key: str) -> str:
+    return f"{_miner_prefix_keys(env_key, miner_key)}index.json"
+
+# ── Index discovery ────────────────────────────────────────────────────────
+async def _index() -> list[str]:
+    """Return list of all miner index.json keys under RESULT_PREFIX."""
+    async with get_client_ctx() as c:
+        paginator = c.get_paginator("list_objects_v2")
+        out = []
+        async for page in paginator.paginate(Bucket=FOLDER, Prefix=RESULT_PREFIX):
+            for o in page.get("Contents", []):
+                if o["Key"].endswith("/index.json"):
+                    out.append(o["Key"])
+        return sorted(out)
+
+async def _update_index(k: str) -> None:
+    """Keep a global list of all index.json files at INDEX_KEY (optional)."""
+    async with get_client_ctx() as c:
+        try:
+            r = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
+            idx = set(json.loads(await r["Body"].read()))
+        except c.exceptions.NoSuchKey:
+            idx = set()
+        if k not in idx:
+            idx.add(k)
+            await c.put_object(Bucket=FOLDER, Key=INDEX_KEY,
+                               Body=_dumps(sorted(idx)),
+                               ContentType="application/json")
+
+# ── Head counters ──────────────────────────────────────────────────────────
+async def get_head(env: "BaseEnv", miner: Miner) -> int:
+    """Fast path via index.json; fallback to listing if missing."""
+    assert hasattr(env, "key"), "env must be a BaseEnv with a .key"
+    assert hasattr(miner, "key"), "miner must be a Miner with a .key"
+    key = _miner_index_key(env, miner)
+    async with get_client_ctx() as c:
+        try:
+            r = await c.get_object(Bucket=FOLDER, Key=key)
+            return int(json.loads(await r["Body"].read())["head"])
+        except c.exceptions.NoSuchKey:
+            # fallback: list existing COUNT.json and take max
+            prefix = _miner_prefix(env, miner)
+            paginator = c.get_paginator("list_objects_v2")
+            head = 0
+            async for page in paginator.paginate(Bucket=FOLDER, Prefix=prefix):
+                for o in page.get("Contents", []):
+                    n = Path(o["Key"]).stem
+                    if n.isdigit(): head = max(head, int(n))
+            return head
+
+async def set_head(env: "BaseEnv", miner: Miner, head: int) -> None:
+    assert hasattr(env, "key"), "env must be a BaseEnv with a .key"
+    assert hasattr(miner, "key"), "miner must be a Miner with a .key"
+    key = _miner_index_key(env, miner)
+    async with get_client_ctx() as c:
+        await c.put_object(Bucket=FOLDER, Key=key,
+                           Body=_dumps({"head": int(head)}),
+                           ContentType="application/json")
+    await _update_index(key)
+
+# ── Sink with signed results ───────────────────────────────────────────────────
+async def sign_results( wallet, results ):
+    try:
+        signer_url = get_conf('SIGNER_URL', default='http://signer:8080')
+        timeout = aiohttp.ClientTimeout(connect=2, total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            payloads = [str(r.challenge) for r in results]
+            resp = await session.post(f"{signer_url}/sign", json={"payloads": payloads})
+            if resp.status == 200:
+                data = await resp.json()
+                sigs = data.get("signatures") or []
+                hotkey = data.get("hotkey")
+                for r, s in zip(results, sigs):
+                    r.hotkey = hotkey
+                    r.signature = s
+    except Exception as e:
+        logger.info(f"sink: signer unavailable, using local signing: {type(e).__name__}: {e}")
+        hotkey = wallet.hotkey.ss58_address
+        for r in results: 
+            r.sign(wallet)
+    finally:
+        return hotkey, results
+    
+async def sink(wallet: bt.wallet, env: "BaseEnv", miner: Miner, results: list["Result"]):
+    if not results: return
+    hotkey, signed = await sign_results(wallet, results)
+    dumped = [r.model_dump(mode="json") for r in signed]
+
+    assert hasattr(env, "key") and hasattr(miner, "key")
+    head = await get_head(env, miner)
+    new_head = head + len(dumped)
+    key = f"{_miner_prefix(env, miner)}{new_head}.json"
+
+    async with get_client_ctx() as c:
+        await c.put_object(Bucket=FOLDER, Key=key,
+                           Body=_dumps(dumped),
+                           ContentType="application/json")
+    await set_head(env, miner, new_head)
+
+# ── Cache of COUNT.json batches (small, single JSON arrays) ────────────────
+async def _cache_batch(key: str, sem: asyncio.Semaphore) -> Path:
+    # Namespace cache by env/miner to avoid filename collisions across pairs
+    rel = key[len(RESULT_PREFIX):] if key.startswith(RESULT_PREFIX) else key
+    out = CACHE_DIR / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    mod = out.with_suffix(".modified")
+    async with sem, get_client_ctx() as c:
+        if out.exists() and mod.exists():
+            h = await c.head_object(Bucket=FOLDER, Key=key)
+            if h["LastModified"].isoformat() == mod.read_text().strip():
+                return out
+        o = await c.get_object(Bucket=FOLDER, Key=key)
+        body, lm = await o["Body"].read(), o["LastModified"].isoformat()
+    tmp = out.with_suffix(".tmp")
+    with tmp.open("wb") as f: f.write(body)
+    os.replace(tmp, out); mod.write_text(lm)
+    return out
+
+# ── Iterate compactly over stored Results ──────────────────────────────────
+async def _iter_batch_file(p: Path):
+    try:
+        import aiofiles
+        async with aiofiles.open(p, "rb") as f:
+            data = _loads(await f.read())   # batch is a JSON array
+    except ModuleNotFoundError:
+        data = await asyncio.to_thread(lambda: _loads(p.read_bytes()))
+    for obj in data:
+        try:
+            r = Result.model_validate(obj)
+            if r.verify(): yield r
+        except Exception:
+            pass
+
+# ── Core async stream (Result objects) ─────────────────────────────────────
+async def dataset(
+    tail: int,
+    envs: list = None,
+    miners: list = None,
+    *,
+    max_concurrency: int = 10,
+) -> AsyncIterator["Result"]:
+    """
+    Stream up to `tail` recent results across selected (env, miner) paths.
+    Order: increasing COUNT within each (env,miner); global interleave by LastModified.
+    """
+    # discover (env, miner, head)
+    idx_keys = await _index()
+    pairs = []
+    async with get_client_ctx() as c:
+        for ik in idx_keys:
+            parts = Path(ik).parts  # ['affine','results','<env>','<miner>','index.json']
+            if len(parts) < 5: continue
+            env, miner = parts[-3], parts[-2]
+            if envs:
+                allowed_envs = { (getattr(e, "key", None) or getattr(e, "name", None) or str(e)) for e in envs }
+                if (env not in allowed_envs):
+                    continue
+            if miners:
+                allowed_miners = { (getattr(m, "key", None) or str(m)) for m in miners }
+                if (miner not in allowed_miners):
+                    continue
+            try:
+                r = await c.get_object(Bucket=FOLDER, Key=ik)
+                head = int(json.loads(await r["Body"].read())["head"])
+                if head > 0: pairs.append((env, miner, head))
+            except Exception:
+                pass
+
+    # build list of COUNT.json keys (bounded by tail heuristic)
+    keys = []
+    remain = tail
+    for env, miner, head in pairs:
+        # pull up to `remain` from the end for each (env,miner); adjust as needed
+        start = max(1, head - remain + 1)
+        for n in range(start, head + 1):
+            keys.append((env, miner, n))
+    # fetch in order of LastModified (newest last for stable forward stream)
+    async with get_client_ctx() as c:
+        s3keys = [f"{_miner_prefix_keys(e,m)}{n}.json" for e,m,n in keys]
+        lm = {}
+        for k in s3keys[:1000]:  # cheap head for ordering; cap per call
+            try:
+                h = await c.head_object(Bucket=FOLDER, Key=k)
+                lm[k] = h["LastModified"]
+            except Exception:
+                pass
+    s3keys.sort(key=lambda k: lm.get(k, dt.datetime.min))
+
+    # prefetch/cache and stream
+    sem = asyncio.Semaphore(max_concurrency)
+    files = [asyncio.create_task(_cache_batch(k, sem)) for k in s3keys]
+    emitted = 0
+    for t in files:
+        p = await t
+        async for r in _iter_batch_file(p):
+            yield r
+            emitted += 1
+            if emitted >= tail: return
+
+# ── Prune cache by COUNT threshold (simple heuristic) ──────────────────────
+async def prune(tail: int):
+    """
+    Ensure exactly `tail` results are retained per (env, miner) cache.
+    Deletes older files entirely when fully before the cutoff, and rewrites the
+    boundary file to keep only the needed suffix so the retained total equals `tail`.
+    """
+    try:
+        idx_keys = await _index()
+    except Exception:
+        idx_keys = []
+
+    # Map env/miner -> (remote head, local dir)
+    pairs: list[tuple[str, str, int, Path]] = []
+    async with get_client_ctx() as c:
+        for ik in idx_keys:
+            parts = Path(ik).parts
+            if len(parts) < 5:
+                continue
+            env_key, miner_key = parts[-3], parts[-2]
+            try:
+                r = await c.get_object(Bucket=FOLDER, Key=ik)
+                head = int(json.loads(await r["Body"].read())["head"])
+            except Exception:
+                head = 0
+            local_dir = CACHE_DIR / env_key / miner_key
+            if head > 0 and local_dir.exists():
+                pairs.append((env_key, miner_key, head, local_dir))
+
+    # Prune each (env, miner)
+    for _, _, head, local_dir in pairs:
+        try:
+            cutoff = max(0, head - tail)
+            files = [p for p in local_dir.glob("*.json") if p.stem.isdigit()]
+            files.sort(key=lambda p: int(p.stem))
+            prev_head = 0
+            for p in files:
+                H = int(p.stem)
+                if H <= cutoff:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                    try:
+                        p.with_suffix(".modified").unlink()
+                    except OSError:
+                        pass
+                    prev_head = H
+                    continue
+                # Boundary file: prev_head <= cutoff < H
+                if prev_head <= cutoff < H:
+                    need = H - cutoff
+                    try:
+                        data = await asyncio.to_thread(lambda: _loads(p.read_bytes()))
+                    except Exception:
+                        data = []
+                    if isinstance(data, list) and len(data) > need:
+                        trimmed = data[-need:]
+                        tmp = p.with_suffix(".tmp")
+                        try:
+                            with tmp.open("wb") as f:
+                                f.write(_dumps(trimmed))
+                            os.replace(tmp, p)
+                        finally:
+                            try:
+                                if tmp.exists(): tmp.unlink()
+                            except Exception:
+                                pass
+                prev_head = H
+        except Exception:
+            # best-effort per directory; continue
+            continue
+
+
+# --------------------------------------------------------------------------- #
 #                               CLI                                           #
 # --------------------------------------------------------------------------- #
 @click.group()
@@ -699,45 +854,134 @@ async def watchdog(timeout: int = 300):
 #                               Runner                                        #
 # --------------------------------------------------------------------------- #
 @cli.command("runner")
-def runner():    
+def runner():
     coldkey = get_conf("BT_WALLET_COLD", "default")
     hotkey  = get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
-    
+    logger.info(f"Runner starting with wallet {coldkey}/{hotkey}")
+    # from .envs.sat import SAT
+    # envs = {SAT.__name__: SAT()}
+    envs = {name: cls() for name, cls in ENVS.items()}   # single instances
+    logger.info(f"Building envs: {envs}")
+
     async def _run():
-        subtensor = None
-        envs = { name: cls() for name, cls in ENVS.items() }
+        logger.debug("Warming up...")
+        # Warm up subtensor.
+        await get_subtensor()
+        logger.info(f"Subtensor is warm.")
+
+        # Warm up envs.
+        for env in envs.values():
+            await env.generate()
+            logger.info(f"{env} is warm")
+            await asyncio.sleep(3)
+        logger.info(f"Envs are warm")
+
+        MINERS = None
+        WEIGHTS = None
+        async def sync_state():
+            nonlocal MINERS, WEIGHTS
+            logger.info('Sync state ...')
+            sub = await get_subtensor()
+            meta = await sub.metagraph(NETUID)
+            MINERS = await miners( meta = meta )  
+            logger.info(f'Pulled {len(MINERS.keys())} miners')
+            WEIGHTS = defaultdict(lambda: defaultdict(float))
+            logger.info('Pulling counts ...')
+            async def get_count_for_miner(uid, m):
+                miner_counts = {}
+                for _, e_inst in envs.items():
+                    count = await get_head(e_inst, m)
+                    miner_counts[e_inst.key] = count
+                return m.key, miner_counts
+            tasks = [get_count_for_miner(uid, m) for uid, m in MINERS.items()]
+            results = await asyncio.gather(*tasks)
+            counts = dict(results)
+            eps = 1e-6
+            env_keys = [e.key for e in envs.values()]
+            for e_key in env_keys:
+                table_data = [];
+                emax = max([counts.get(m.key, {}).get(e_key, 0) for m in MINERS.values()]) if MINERS else 0
+                etotal = sum([counts.get(m.key, {}).get(e_key, 0) for m in MINERS.values()]) if MINERS else 0
+                for m in MINERS.values():
+                    weight = (emax - counts.get(m.key, {}).get(e_key, 0) + eps) / (etotal + eps)
+                    WEIGHTS[m.key][e_key] = weight
+                    row = {'uid': m.uid, 'env': e_key, 'cnt': counts.get(m.key, {}).get(e_key, 0), 'max': emax, 'w': weight }
+                    table_data.append(row)
+                logger.info("\n" + tabulate(table_data, headers='keys', tablefmt='pretty'))
+                
+        # Create a env and query a single miner.
+        K = 1
+        BUFFER = defaultdict(lambda: defaultdict(list))       
+        async def one(env_instance, m):
+            chal = await env_instance.generate()
+            result = await run(challenges=[chal], miners=[m], timeout=180)
+            BUFFER[env_instance.key][m.key].extend(result)
+            if len(BUFFER[env_instance.key][m.key]) >= K:
+                logger.debug(f"Buffer full for {m.key[:18]}... in {env_instance.key}, sinking {K} results")
+                await sink(wallet, env_instance, m, BUFFER[env_instance.key][m.key])
+                BUFFER[env_instance.key][m.key] = []
+                logger.debug(f"Buffer cleared for {m.key[:18]}... in {env_instance.key}")
+            if not result[0].response.success:
+                # We slash the weights here so that we are unlikely to query them again.
+                nonlocal WEIGHTS
+                WEIGHTS[m.key][env_instance.key] = WEIGHTS[m.key][env_instance.key]/2
+            
+        MAX_INFLIGHT = 30
+        inflight: set[asyncio.Task] = set()    
+        last_sync = 0           
+        logger.info("Starting main runner loop")
         while True:
-            global HEARTBEAT
             try:
-                if subtensor is None: subtensor = await get_subtensor()
-                meta = await subtensor.metagraph( NETUID )
-                blk = await subtensor.get_current_block()
-                HEARTBEAT = time.monotonic()
-                miners_map = await miners(meta=meta)
-                challenges = [await e.generate() for e in envs.values()]
-                results    = await run(challenges, miners_map, timeout=180)
-                await sink( wallet = wallet, block = blk, results = results )
-            except asyncio.CancelledError: break
+                
+                # Finish current tasks.
+                if len(inflight) >= MAX_INFLIGHT:
+                    logger.debug(f"Max inflight reached ({MAX_INFLIGHT}), waiting for completion")
+                    done, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done: inflight.discard(t)
+                    
+                # Heartbeat and state update.
+                global HEARTBEAT; HEARTBEAT = time.monotonic()                  
+                if (time.time() - last_sync > 60*2) or (MINERS == None) or (WEIGHTS == None) or len(MINERS.keys()) == 0:
+                    logger.info("Syncing state ...")
+                    await sync_state()
+                    last_sync = time.time()
+                    continue
+                
+                # Select next env and miner.
+                env_name, env_instance = random.choice(list(envs.items()))
+                miner_objects = list(MINERS.values())
+                weight_values = [WEIGHTS.get(m.key, {}).get(env_instance.key, 1.0) for m in miner_objects]
+                # Fallback to uniform if all zeros
+                if not any(w > 0 for w in weight_values):
+                    weight_values = [1.0 for _ in miner_objects]
+                miner = random.choices(miner_objects, weights=weight_values)[0]
+                logger.debug(f"Selected miner: {miner.uid}, env: {env_instance.key} and weight: {WEIGHTS.get(miner.key, {}).get(env_instance.key, 0.0)} ")
+
+                # Create and record the task
+                t = asyncio.create_task(one(env_instance, miner))
+                inflight.add(t)
+                await asyncio.sleep(1)
+                    
+            except asyncio.CancelledError:
+                logger.info("Runner cancelled, breaking loop")
+                return
             except Exception as e:
                 traceback.print_exc()
-                logger.info(f"Error in runner loop: {e}. Continuing ...")
-                subtensor = None  # Force reconnection on next iteration
-                await asyncio.sleep(10)  # Wait before retrying
-                continue
+                logger.error(f"Runner error: {type(e).__name__}: {str(e)}; retrying...")
+                subtensor = await get_subtensor()
+                await asyncio.sleep(5)
+        
     async def main():
-        await asyncio.gather(
-            _run(),
-            watchdog(timeout = (60 * 10))
-        )
+        logger.info("Starting main() with runner and watchdog")
+        await asyncio.gather(_run(), watchdog(timeout=60*10))
+
     asyncio.run(main())
-    
-    
+
 
 # --------------------------------------------------------------------------- #
 #                               Validator                                     #
 # --------------------------------------------------------------------------- #
-    
 async def _set_weights_with_confirmation(
     wallet: "bt.wallet",
     netuid: int,
@@ -1016,11 +1260,22 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
     logger.info("Computed accuracy & updated MAXENV.")
 
     # --- eligibility: require near-max samples per env ------------------------
-    required = {
-        e: int(ELIG * max((cnt[hk][e] for hk in active_hks), default=0))
-        for e in ENVS
+    async def _heads_for_active(active_hks: list[str]) -> dict[str, dict[str, int]]:
+        by_env = {e: {} for e in ENVS}
+        async def one(e: str, hk: str):
+            try:
+                by_env[e][hk] = await get_head(env=e, miner=hk)
+            except Exception:
+                by_env[e][hk] = 0
+        await asyncio.gather(*(one(e, hk) for e in ENVS for hk in active_hks))
+        return by_env
+
+    heads_by_env = await _heads_for_active(active_hks)
+    required = {e: int(ELIG * max(heads_by_env[e].values() or [0])) for e in ENVS}
+    eligible = {
+        hk for hk in active_hks
+        if all(heads_by_env[e].get(hk, 0) >= required[e] for e in ENVS)
     }
-    eligible = {hk for hk in active_hks if all(cnt[hk][e] >= required[e] for e in ENVS)}
 
     # --- ε-Pareto dominance helpers ------------------------------------------
     def thr_not_worse(a_i: float, n_i: int, a_j: float, n_j: int) -> float:
@@ -1252,7 +1507,7 @@ def validate():
                 LAST = BLOCK           
             
                 # ---------------- Other telemetry ------------------------
-                CACHE.set(sum( f.stat().st_size for f in CACHE_DIR.glob("*.jsonl") if f.is_file()))
+                CACHE.set(sum( f.stat().st_size for f in CACHE_DIR.rglob("*.json") if f.is_file()))
                 
             except asyncio.CancelledError: break
             except Exception as e:
@@ -1514,6 +1769,7 @@ chute = build_sglang_chute(
         miner  = (await miners(netuid=NETUID))[my_uid]
 
         while not (miner.chute or {}).get("hot", False):
+            from .envs import SAT
             challenge = await SAT().generate()
             await run(challenges=challenge, miners=[miner])
             await sub.wait_for_block()

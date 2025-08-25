@@ -67,8 +67,8 @@ Please generate a valid input:"""
 dataset = af.singleton('rl-python', lambda: af.utils.BufferedDataset(
     dataset_name="satpalsr/rl-python",
     total_size=20_000,
-    buffer_size=5,
-    max_batch=5,
+    buffer_size=30,
+    max_batch=30,
 ))
 
 class ABD(af.BaseEnv):

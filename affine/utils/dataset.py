@@ -52,7 +52,7 @@ class BufferedDataset:
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(url, timeout=30) as resp:
                     if resp.status == 429:
-                        af.logger.warning(f"Ratelimit hit; sleeping {backoff:.1f}s")
+                        af.logger.warning(f"{self.dataset_name} - Ratelimit hit; sleeping {backoff:.1f}s")
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * self.backoff_factor, self.max_backoff)
                         continue
