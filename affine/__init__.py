@@ -166,7 +166,7 @@ async def get_subtensor():
     global SUBTENSOR
     if SUBTENSOR == None:
         logger.trace("Making Bittensor connection...")
-        SUBTENSOR = bt.async_subtensor( get_conf('SUBTENSOR_ENDPOINT', default='finney') )
+        SUBTENSOR = bt.async_subtensor( get_conf('SUBTENSOR_ENDPOINT', default='archive') )
         try:
             await SUBTENSOR.initialize()
             logger.trace("Connected")
@@ -492,10 +492,12 @@ async def miners(
                     chute=chute,
                 )
                 return miner
-        except: pass
+        except Exception as e:
+            logger.info(e)
+            print (e)
+            pass        
     results = await asyncio.gather(*(fetch(uid) for uid in uids))
     output = {uid: m for uid, m in zip(uids, results) if m is not None}
-    # Remove duplicates.
     if output:
         best_by_model: Dict[str, Tuple[int, int]] = {}
         for uid, m in output.items():
@@ -662,12 +664,16 @@ async def _cache_batch(key: str, sem: asyncio.Semaphore) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     mod = out.with_suffix(".modified")
     async with sem, get_client_ctx() as c:
-        if out.exists() and mod.exists():
-            h = await c.head_object(Bucket=FOLDER, Key=key)
-            if h["LastModified"].isoformat() == mod.read_text().strip():
-                return out
-        o = await c.get_object(Bucket=FOLDER, Key=key)
-        body, lm = await o["Body"].read(), o["LastModified"].isoformat()
+        try:
+            if out.exists() and mod.exists():
+                h = await c.head_object(Bucket=FOLDER, Key=key)
+                if h["LastModified"].isoformat() == mod.read_text().strip():
+                    return out
+            o = await c.get_object(Bucket=FOLDER, Key=key)
+            body, lm = await o["Body"].read(), o["LastModified"].isoformat()
+        except c.exceptions.NoSuchKey:
+            # Key doesn't exist in S3, return None to signal missing file
+            return None
     tmp = out.with_suffix(".tmp")
     with tmp.open("wb") as f: f.write(body)
     os.replace(tmp, out); mod.write_text(lm)
@@ -741,7 +747,7 @@ async def dataset(
                 lm[k] = h["LastModified"]
             except Exception:
                 pass
-    s3keys.sort(key=lambda k: lm.get(k, dt.datetime.min))
+    s3keys.sort(key=lambda k: lm.get(k, dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
 
     # prefetch/cache and stream
     sem = asyncio.Semaphore(max_concurrency)
@@ -749,83 +755,12 @@ async def dataset(
     emitted = 0
     for t in files:
         p = await t
+        if p is None:  # Skip missing files
+            continue
         async for r in _iter_batch_file(p):
             yield r
             emitted += 1
             if emitted >= tail: return
-
-# ── Prune cache by COUNT threshold (simple heuristic) ──────────────────────
-async def prune(tail: int):
-    """
-    Ensure exactly `tail` results are retained per (env, miner) cache.
-    Deletes older files entirely when fully before the cutoff, and rewrites the
-    boundary file to keep only the needed suffix so the retained total equals `tail`.
-    """
-    try:
-        idx_keys = await _index()
-    except Exception:
-        idx_keys = []
-
-    # Map env/miner -> (remote head, local dir)
-    pairs: list[tuple[str, str, int, Path]] = []
-    async with get_client_ctx() as c:
-        for ik in idx_keys:
-            parts = Path(ik).parts
-            if len(parts) < 5:
-                continue
-            env_key, miner_key = parts[-3], parts[-2]
-            try:
-                r = await c.get_object(Bucket=FOLDER, Key=ik)
-                head = int(json.loads(await r["Body"].read())["head"])
-            except Exception:
-                head = 0
-            local_dir = CACHE_DIR / env_key / miner_key
-            if head > 0 and local_dir.exists():
-                pairs.append((env_key, miner_key, head, local_dir))
-
-    # Prune each (env, miner)
-    for _, _, head, local_dir in pairs:
-        try:
-            cutoff = max(0, head - tail)
-            files = [p for p in local_dir.glob("*.json") if p.stem.isdigit()]
-            files.sort(key=lambda p: int(p.stem))
-            prev_head = 0
-            for p in files:
-                H = int(p.stem)
-                if H <= cutoff:
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
-                    try:
-                        p.with_suffix(".modified").unlink()
-                    except OSError:
-                        pass
-                    prev_head = H
-                    continue
-                # Boundary file: prev_head <= cutoff < H
-                if prev_head <= cutoff < H:
-                    need = H - cutoff
-                    try:
-                        data = await asyncio.to_thread(lambda: _loads(p.read_bytes()))
-                    except Exception:
-                        data = []
-                    if isinstance(data, list) and len(data) > need:
-                        trimmed = data[-need:]
-                        tmp = p.with_suffix(".tmp")
-                        try:
-                            with tmp.open("wb") as f:
-                                f.write(_dumps(trimmed))
-                            os.replace(tmp, p)
-                        finally:
-                            try:
-                                if tmp.exists(): tmp.unlink()
-                            except Exception:
-                                pass
-                prev_head = H
-        except Exception:
-            # best-effort per directory; continue
-            continue
 
 
 # --------------------------------------------------------------------------- #
@@ -859,119 +794,135 @@ def runner():
     hotkey  = get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
     logger.info(f"Runner starting with wallet {coldkey}/{hotkey}")
-    # from .envs.sat import SAT
-    # envs = {SAT.__name__: SAT()}
-    envs = {name: cls() for name, cls in ENVS.items()}   # single instances
-    logger.info(f"Building envs: {envs}")
 
     async def _run():
-        logger.debug("Warming up...")
+        
         # Warm up subtensor.
-        await get_subtensor()
+        logger.debug("Warming up...")
+        sub = await get_subtensor()
         logger.info(f"Subtensor is warm.")
 
         # Warm up envs.
+        # envs = {name: cls() for name, cls in ENVS.items()}   # single instances
+        from .envs import SAT
+        envs = {'SAT': SAT()}   # single instances
+        logger.info(f"Building envs: {envs}")
         for env in envs.values():
             await env.generate()
             logger.info(f"{env} is warm")
             await asyncio.sleep(3)
         logger.info(f"Envs are warm")
+ 
+        # Keep a live metagraph.
+        METAGRAPH = await sub.metagraph(NETUID)
+        async def update_metagraph():
+            await asyncio.sleep(12 * 300)
+            logger.info("Pulling latest metagraph")
+            nonlocal METAGRAPH
+            try: sub = await get_subtensor(); METAGRAPH = await sub.metagraph(NETUID)
+            except Exception as e: logger.error(f"Failed to update metagraph: {e}")
+            await update_metagraph()
+        logger.info(f"Metagraph is warm")
+        metagraph_task = asyncio.create_task(update_metagraph())
 
-        MINERS = None
-        WEIGHTS = None
-        async def sync_state():
-            nonlocal MINERS, WEIGHTS
-            logger.info('Sync state ...')
-            sub = await get_subtensor()
-            meta = await sub.metagraph(NETUID)
-            MINERS = await miners( meta = meta )  
-            logger.info(f'Pulled {len(MINERS.keys())} miners')
-            WEIGHTS = defaultdict(lambda: defaultdict(float))
-            logger.info('Pulling counts ...')
-            async def get_count_for_miner(uid, m):
-                miner_counts = {}
-                for _, e_inst in envs.items():
-                    count = await get_head(e_inst, m)
-                    miner_counts[e_inst.key] = count
-                return m.key, miner_counts
-            tasks = [get_count_for_miner(uid, m) for uid, m in MINERS.items()]
-            results = await asyncio.gather(*tasks)
-            counts = dict(results)
-            eps = 1e-6
-            env_keys = [e.key for e in envs.values()]
-            for e_key in env_keys:
-                table_data = [];
-                emax = max([counts.get(m.key, {}).get(e_key, 0) for m in MINERS.values()]) if MINERS else 0
-                etotal = sum([counts.get(m.key, {}).get(e_key, 0) for m in MINERS.values()]) if MINERS else 0
-                for m in MINERS.values():
-                    weight = (emax - counts.get(m.key, {}).get(e_key, 0) + eps) / (etotal + eps)
-                    WEIGHTS[m.key][e_key] = weight
-                    row = {'uid': m.uid, 'env': e_key, 'cnt': counts.get(m.key, {}).get(e_key, 0), 'max': emax, 'w': weight }
-                    table_data.append(row)
-                logger.info("\n" + tabulate(table_data, headers='keys', tablefmt='pretty'))
-                
+        # Keep live miner terms.
+        eps = 1e-6
+        MINERS = {}
+        COUNTS = defaultdict(lambda: defaultdict(int))
+        ENVMAX = defaultdict(int)
+        ENVTOTAL = defaultdict(int)
+        WEIGHTS = defaultdict(lambda: defaultdict(lambda: 0.0))
+        async def update_weights(uid: int, recursive:bool = False):
+            nonlocal METAGRAPH
+            uid = int(uid)
+            try: 
+                logger.info(f"Updating uid:{uid}")
+                results = await miners( uid, meta = METAGRAPH )
+                print(results)
+                miner = results[uid]
+                MINERS[uid] = miner
+                for _, e in envs.items():
+                    COUNT = await get_head(e, miner )
+                    ENVMAX[ e.key ] = max( ENVMAX[ e.key ], COUNT )
+                    ENVTOTAL[ e.key ] -= COUNTS[ miner.key ][ e.key ] 
+                    ENVTOTAL[ e.key ] += COUNT
+                    COUNTS[ miner.key ][ e.key ] = COUNT
+                    WEIGHTS[ miner.key ][ e.key ] = (ENVMAX[ e.key ] - COUNT + eps) / (ENVTOTAL[ e.key ]  + eps)
+                    logger.info(f"Updating uid:{uid}, env:{e.key}, count:{COUNT}, envmax:{ENVMAX[e.key]}, envtotal:{ENVTOTAL[e.key]}, weight:{WEIGHTS[miner.key][e.key]}")
+
+            except Exception as e: 
+                traceback.print_exc()
+                logger.info(e)
+                pass
+            await asyncio.sleep(1)
+            await update_weights( random.choice( METAGRAPH.uids ), recursive = True)
+        logger.info(f"Weights are warm.")
+        await update_weights(0, recursive = False)
+        while len(MINERS) == 0:
+            await update_weights(random.choice( METAGRAPH.uids ), recursive = False)
+        weights_task = asyncio.create_task(update_weights(0, recursive = True))
+
+
         # Create a env and query a single miner.
         K = 1
         BUFFER = defaultdict(lambda: defaultdict(list))       
-        async def one(env_instance, m):
-            chal = await env_instance.generate()
+        async def one(env, m):
+            logger.info(f"Generating challenge for env: {env}")
+            chal = await env.generate()
+            logger.info(f"Querying...")
             result = await run(challenges=[chal], miners=[m], timeout=180)
-            BUFFER[env_instance.key][m.key].extend(result)
-            if len(BUFFER[env_instance.key][m.key]) >= K:
-                logger.debug(f"Buffer full for {m.key[:18]}... in {env_instance.key}, sinking {K} results")
-                await sink(wallet, env_instance, m, BUFFER[env_instance.key][m.key])
-                BUFFER[env_instance.key][m.key] = []
-                logger.debug(f"Buffer cleared for {m.key[:18]}... in {env_instance.key}")
+            logger.info(f"Extending buffer.")
+            BUFFER[env.key][m.key].extend(result)
+            if len(BUFFER[env.key][m.key]) >= K:
+                logger.info(f"Draining buffer")
+                await sink(wallet, env, m, BUFFER[env.key][m.key])
+                BUFFER[env.key][m.key] = []
             if not result[0].response.success:
                 # We slash the weights here so that we are unlikely to query them again.
                 nonlocal WEIGHTS
-                WEIGHTS[m.key][env_instance.key] = WEIGHTS[m.key][env_instance.key]/2
+                WEIGHTS[m.key][env.key] = WEIGHTS[m.key][env.key]/2
             
         MAX_INFLIGHT = 30
         inflight: set[asyncio.Task] = set()    
-        last_sync = 0           
         logger.info("Starting main runner loop")
         while True:
             try:
+                global HEARTBEAT; HEARTBEAT = time.monotonic() 
                 
                 # Finish current tasks.
                 if len(inflight) >= MAX_INFLIGHT:
                     logger.debug(f"Max inflight reached ({MAX_INFLIGHT}), waiting for completion")
                     done, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
                     for t in done: inflight.discard(t)
-                    
-                # Heartbeat and state update.
-                global HEARTBEAT; HEARTBEAT = time.monotonic()                  
-                if (time.time() - last_sync > 60*2) or (MINERS == None) or (WEIGHTS == None) or len(MINERS.keys()) == 0:
-                    logger.info("Syncing state ...")
-                    await sync_state()
-                    last_sync = time.time()
-                    continue
                 
                 # Select next env and miner.
-                env_name, env_instance = random.choice(list(envs.items()))
-                miner_objects = list(MINERS.values())
-                weight_values = [WEIGHTS.get(m.key, {}).get(env_instance.key, 1.0) for m in miner_objects]
-                # Fallback to uniform if all zeros
-                if not any(w > 0 for w in weight_values):
-                    weight_values = [1.0 for _ in miner_objects]
-                miner = random.choices(miner_objects, weights=weight_values)[0]
-                logger.debug(f"Selected miner: {miner.uid}, env: {env_instance.key} and weight: {WEIGHTS.get(miner.key, {}).get(env_instance.key, 0.0)} ")
+                _, env = random.choice(list(envs.items()))
+                all_miners = list(MINERS.values())
+                all_weights = [WEIGHTS[ m.key ][ env.key ] for m in all_miners]
+                if len (all_weights) == 0: await asyncio.sleep(1); continue
+                miner = random.choices(all_miners, weights=all_weights)[0]
+                logger.debug(f"Selected miner: {miner.uid}, env: {env.key} and weight: {WEIGHTS[miner.key][env.key]} ")
+                await asyncio.sleep(3)
 
                 # Create and record the task
-                t = asyncio.create_task(one(env_instance, miner))
+                t = asyncio.create_task(one(env, miner))
                 inflight.add(t)
                 await asyncio.sleep(1)
                     
             except asyncio.CancelledError:
                 logger.info("Runner cancelled, breaking loop")
-                return
+                break
             except Exception as e:
                 traceback.print_exc()
                 logger.error(f"Runner error: {type(e).__name__}: {str(e)}; retrying...")
                 subtensor = await get_subtensor()
                 await asyncio.sleep(5)
-        
+            finally:
+                metagraph_task.cancel()
+                weights_task.cancel()                
+                for t in inflight: t.cancel()                
+                if inflight: await asyncio.gather(*inflight, return_exceptions=True)    
+            
     async def main():
         logger.info("Starting main() with runner and watchdog")
         await asyncio.gather(_run(), watchdog(timeout=60*10))
@@ -1196,10 +1147,6 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
 
     # --- fetch + prune --------------------------------------------------------
     st = await get_subtensor()
-    blk = await st.get_current_block()
-    logger.info(f"Pruning {tail} blocks from {blk - tail} to {blk}")
-    await prune(tail=tail)
-
     meta = await st.metagraph(NETUID)
     BASE_HK = meta.hotkeys[0]
     N_envs = len(ENVS)
@@ -1212,7 +1159,6 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
     first_block = {}                                          # earliest block for current version
 
     # --- ingest ---------------------------------------------------------------
-    logger.info(f"Loading data from {blk - tail} to {blk}")
     async for c in dataset(tail=tail):
         NRESULTS.inc()
         hk, env = c.miner.hotkey, c.challenge.env.name
