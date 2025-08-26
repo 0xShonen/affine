@@ -14,7 +14,9 @@ Why affine? Directed incentives for RL have never been achieved. The ability to 
 
 ## Installation
 ```bash
-# Install uv Astral
+# Install uv (Astral)
+sudo apt-get update
+sudo apt-get install -y build-essential python3-dev libc6-dev linux-libc-dev
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and install Affine
@@ -25,6 +27,7 @@ uv venv && source .venv/bin/activate && uv pip install -e .
 # Verify installation
 af
 ```
+
 
 ## Validating
 
